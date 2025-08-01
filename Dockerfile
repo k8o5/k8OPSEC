@@ -1,69 +1,69 @@
-# Verwende eine leichte Base-Image
-FROM alpine:3.18
+# Stage 1: Build stage (minimal, to reduce final image size and attack surface)
+FROM alpine:latest AS builder
+RUN apk add --no-cache wireguard-tools bash
 
-# Installiere OpenVPN, Easy-RSA und Bash für Skripte
-RUN apk add --no-cache openvpn easy-rsa bash && \
-    ln -s /usr/share/easy-rsa/easyrsa /usr/local/bin/easyrsa && \
-    mkdir -p /etc/openvpn/server /etc/openvpn/easy-rsa /etc/openvpn/client
+# Stage 2: Runtime stage (secure, minimal base image)
+FROM linuxserver/wireguard:latest
 
-# Initialisiere PKI und generiere Zertifikate
-RUN easyrsa init-pki && \
-    easyrsa --batch build-ca nopass && \
-    easyrsa --batch gen-dh && \
-    easyrsa --batch build-server-full server nopass && \
-    easyrsa --batch build-client-full client nopass && \
-    openvpn --genkey secret /etc/openvpn/server/ta.key
+# Copy tools from builder stage
+COPY --from=builder /usr/bin/wg /usr/bin/wg
+COPY --from=builder /usr/bin/wg-quick /usr/bin/wg-quick
+COPY --from=builder /bin/bash /bin/bash
 
-# Erstelle Server-Konfiguration
-RUN echo "port 443" > /etc/openvpn/server/server.conf && \
-    echo "proto tcp" >> /etc/openvpn/server/server.conf && \
-    echo "dev tun" >> /etc/openvpn/server/server.conf && \
-    echo "ca /etc/openvpn/easy-rsa/pki/ca.crt" >> /etc/openvpn/server/server.conf && \
-    echo "cert /etc/openvpn/easy-rsa/pki/issued/server.crt" >> /etc/openvpn/server/server.conf && \
-    echo "key /etc/openvpn/easy-rsa/pki/private/server.key" >> /etc/openvpn/server/server.conf && \
-    echo "dh /etc/openvpn/easy-rsa/pki/dh.pem" >> /etc/openvpn/server/server.conf && \
-    echo "tls-auth /etc/openvpn/server/ta.key 0" >> /etc/openvpn/server/server.conf && \
-    echo "server 10.8.0.0 255.255.255.0" >> /etc/openvpn/server/server.conf && \
-    echo "push \"redirect-gateway def1 bypass-dhcp\"" >> /etc/openvpn/server/server.conf && \
-    echo "push \"dhcp-option DNS 8.8.8.8\"" >> /etc/openvpn/server/server.conf && \
-    echo "keepalive 10 120" >> /etc/openvpn/server/server.conf && \
-    echo "user nobody" >> /etc/openvpn/server/server.conf && \
-    echo "group nogroup" >> /etc/openvpn/server/server.conf
+# Set secure environment variables (defaults; override at runtime with -e flags or secrets)
+ENV PUID=1000 \
+    PGID=1000 \
+    TZ=Etc/UTC \
+    SERVERPORT=51820 \
+    PEERS=1 \
+    PEERDNS=1.1.1.1 \
+    INTERNAL_SUBNET=10.13.13.0 \
+    ALLOWEDIPS=0.0.0.0/0 \
+    LOG_CONFS=false  # Set to true for auditing, false for minimal logs
 
-# Starte OpenVPN und generiere Client-Konfig dynamisch mit CODESPACE_NAME
-CMD bash -c " \
-    openvpn --config /etc/openvpn/server/server.conf & \
-    sleep 5; \
-    if [ -z \"\$CODESPACE_NAME\" ]; then \
-        echo 'Error: CODESPACE_NAME not set. Set it when running the container.'; \
-        exit 1; \
-    fi; \
-    REMOTE_HOST=\"\$CODESPACE_NAME.app.github.dev\"; \
-    echo \"Client config generated at /etc/openvpn/client/client.ovpn with remote \$REMOTE_HOST 443\"; \
-    (echo 'client'; \
-     echo 'dev tun'; \
-     echo 'proto tcp'; \
-     echo \"remote \$REMOTE_HOST 443\"; \
-     echo 'resolv-retry infinite'; \
-     echo 'nobind'; \
-     echo 'persist-key'; \
-     echo 'persist-tun'; \
-     echo 'remote-cert-tls server'; \
-     echo 'tls-auth ta.key 1'; \
-     echo 'key client.key'; \
-     echo 'cert client.crt'; \
-     echo 'ca ca.crt'; \
-     echo 'verb 3') > /etc/openvpn/client/client.ovpn; \
-    echo '<ca>' >> /etc/openvpn/client/client.ovpn; \
-    cat /etc/openvpn/easy-rsa/pki/ca.crt >> /etc/openvpn/client/client.ovpn; \
-    echo '</ca>' >> /etc/openvpn/client/client.ovpn; \
-    echo '<cert>' >> /etc/openvpn/client/client.ovpn; \
-    cat /etc/openvpn/easy-rsa/pki/issued/client.crt >> /etc/openvpn/client/client.ovpn; \
-    echo '</cert>' >> /etc/openvpn/client/client.ovpn; \
-    echo '<key>' >> /etc/openvpn/client/client.ovpn; \
-    cat /etc/openvpn/easy-rsa/pki/private/client.key >> /etc/openvpn/client/client.ovpn; \
-    echo '</key>' >> /etc/openvpn/client/client.ovpn; \
-    echo '<tls-auth>' >> /etc/openvpn/client/client.ovpn; \
-    cat /etc/openvpn/server/ta.key >> /etc/openvpn/client/client.ovpn; \
-    echo '</tls-auth>' >> /etc/openvpn/client/client.ovpn; \
-    tail -f /dev/null"
+# Embed custom entrypoint logic directly (for ephemeral key generation)
+RUN echo '#!/bin/bash' > /entrypoint.sh && \
+    echo 'set -e' >> /entrypoint.sh && \
+    echo 'if [ ! -f /config/wg0.conf ]; then' >> /entrypoint.sh && \
+    echo '  echo "Generating secure WireGuard configs..."' >> /entrypoint.sh && \
+    echo '  mkdir -p /config' >> /entrypoint.sh && \
+    echo '  wg genkey | tee /config/server.key | wg pubkey > /config/server.pub' >> /entrypoint.sh && \
+    echo '  SERVER_PRIVATE_KEY=$(cat /config/server.key)' >> /entrypoint.sh && \
+    echo '  SERVER_PUBLIC_KEY=$(cat /config/server.pub)' >> /entrypoint.sh && \
+    echo '  echo "[Interface]" > /config/wg0.conf' >> /entrypoint.sh && \
+    echo '  echo "Address = ${INTERNAL_SUBNET}/24" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '  echo "PrivateKey = $SERVER_PRIVATE_KEY" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '  echo "ListenPort = $SERVERPORT" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '  for i in $(seq 1 $PEERS); do' >> /entrypoint.sh && \
+    echo '    wg genkey | tee /config/peer$i.key | wg pubkey > /config/peer$i.pub' >> /entrypoint.sh && \
+    echo '    PEER_PRIVATE_KEY=$(cat /config/peer$i.key)' >> /entrypoint.sh && \
+    echo '    PEER_PUBLIC_KEY=$(cat /config/peer$i.pub)' >> /entrypoint.sh && \
+    echo '    echo "" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '    echo "[Peer]" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '    echo "PublicKey = $PEER_PUBLIC_KEY" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '    echo "AllowedIPs = ${INTERNAL_SUBNET}.$((i+1))/32" >> /config/wg0.conf' >> /entrypoint.sh && \
+    echo '    echo "[Interface]" > /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "Address = ${INTERNAL_SUBNET}.$((i+1))/32" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "PrivateKey = $PEER_PRIVATE_KEY" >> /entrypoint.sh && \
+    echo '    echo "DNS = $PEERDNS" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "[Peer]" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "PublicKey = $SERVER_PUBLIC_KEY" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "Endpoint = YOUR_SERVER_IP:$SERVERPORT" >> /config/peer$i.conf  # Replace YOUR_SERVER_IP at runtime' >> /entrypoint.sh && \
+    echo '    echo "AllowedIPs = $ALLOWEDIPS" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '    echo "PersistentKeepalive = 25" >> /config/peer$i.conf' >> /entrypoint.sh && \
+    echo '  done' >> /entrypoint.sh && \
+    echo '  if [ "$LOG_CONFS" != "true" ]; then rm -f /config/*.key; fi  # Clean up keys for OPSEC' >> /entrypoint.sh && \
+    echo 'fi' >> /entrypoint.sh && \
+    echo 'exec /init' >> /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+# Harden the container
+USER 1000:1000  # Run as non-root for least privilege
+HEALTHCHECK --interval=30s --timeout=10s CMD wg show || exit 1
+
+# Expose minimal port
+EXPOSE 51820/udp
+
+# Set entrypoint
+ENTRYPOINT ["/entrypoint.sh"]
